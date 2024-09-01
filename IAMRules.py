@@ -1,113 +1,188 @@
-import csv
-import time
+import boto3
+from botocore.exceptions import ClientError
+import pandas as pd
+import asyncio
 import sys
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
-# Color codes
-BRIGHT_RED = "\033[91m"
-BRIGHT_CYAN = "\033[96m"
-BRIGHT_GREEN = "\033[92m"
-BRIGHT_BLUE = "\033[94m"
-RESET = "\033[0m"
-BOLD = "\033[1m"
+# Define color codes for console output
+RESET = '\033[0m'
+BRIGHT_RED = '\033[91m'
+BRIGHT_GREEN = '\033[92m'
+BRIGHT_CYAN = '\033[96m'
+MAGENTA = '\033[35m'
+YELLOW = '\033[93m'
 
-# Symbols
-SUCCESS_ICON = "✅"
-ERROR_ICON = "❌"
 
-# Set up the necessary variables
-SERVICE_ACCOUNT_FILE = input("Enter the path to JSON file: ")
-SERVICE_ACCOUNT_EMAIL = input("Enter the mail id of the service account: ")
-PROJECT_ID = input("Enter the project ID: ")
-CSV_FILE_PATH = input("Enter the path of the CSV file: ")
+def initialize_iam_client(aws_access_key_id, aws_secret_access_key):
+    """
+    Initialize and return an IAM client.
 
-# Authenticate using the service account
-credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
+    Args:
+        aws_access_key_id (str): AWS Access Key ID.
+        aws_secret_access_key (str): AWS Secret Access Key.
 
-# Initialize the IAM service
-service = build('cloudresourcemanager', 'v1', credentials=credentials)
+    Returns:
+        boto3.Client: IAM client.
+    """
+    return boto3.client(
+        'iam',
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key
+    )
 
-def read_roles_from_csv(csv_file_path):
-    roles = []
-    with open(csv_file_path, mode='r') as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            roles.append(row['Role'])
-    return roles
 
-def print_header(message, color=BRIGHT_BLUE):
-    print(f"{color}{'-' * 50}")
-    print(f"{color}{message.center(50)}{RESET}")
-    print(f"{color}{'-' * 50}{RESET}")
+def print_error(message):
+    """Print error messages in red."""
+    print(f"{BRIGHT_RED}{message}{RESET}")
 
-def print_footer(message, color=BRIGHT_BLUE):
-    print(f"{color}{'-' * 50}")
-    print(f"{color}{message.center(50)}{RESET}")
-    print(f"{color}{'-' * 50}{RESET}")
 
-def print_message(message, style=BRIGHT_CYAN):
-    print(f"{style}{message}{RESET}")
+def print_info(message, color=BRIGHT_CYAN):
+    """Print informational messages in specified color."""
+    print(f"{color}{message}{RESET}")
 
-def print_progress():
-    for i in range(10):
-        sys.stdout.write(f"\rProgress: [{'#' * i}{'.' * (10 - i)}] {i * 10}%")
-        sys.stdout.flush()
-        time.sleep(0.5)
-    print()  # Move to the next line after progress
 
-def assign_role_to_service_account(project_id, service_account_email, roles):
-    retry_attempts = 5
-    print_header("Starting Role Assignment")
-    for role_name in roles:
-        attempt = 0
-        while attempt < retry_attempts:
-            try:
-                # Get the current IAM policy
-                policy = service.projects().getIamPolicy(resource=project_id, body={}).execute()
+def list_iam_users(iam_client):
+    """
+    List all IAM users in the account.
 
-                # Define the new binding
-                new_binding = {
-                    'role': role_name,
-                    'members': [f'serviceAccount:{service_account_email}']
-                }
+    Args:
+        iam_client (boto3.Client): IAM client.
+    """
+    try:
+        paginator = iam_client.get_paginator('list_users')
+        for page in paginator.paginate():
+            for user in page['Users']:
+                print_info(f"User Name: {user['UserName']}", BRIGHT_GREEN)
+    except Exception as e:
+        print_error(f"Error listing IAM users: {e}")
 
-                # Check if the role is already assigned
-                role_exists = False
-                for binding in policy.get('bindings', []):
-                    if binding['role'] == role_name:
-                        if f'serviceAccount:{service_account_email}' in binding['members']:
-                            print_message(f"Service account already has the role: {role_name}", BRIGHT_CYAN)
-                            role_exists = True
-                        else:
-                            binding['members'].append(f'serviceAccount:{service_account_email}')
-                        break
 
-                # If the role does not exist, add the new binding
-                if not role_exists:
-                    policy['bindings'].append(new_binding)
+def list_attached_user_policies(iam_client):
+    """
+    List all IAM users and their attached managed policies.
 
-                # Set the updated IAM policy
-                service.projects().setIamPolicy(resource=project_id, body={'policy': policy}).execute()
-                print_message(f"{SUCCESS_ICON} Successfully assigned role '{role_name}' to service account '{service_account_email}'.", BRIGHT_GREEN)
-                break  # Exit the retry loop on success
+    Args:
+        iam_client (boto3.Client): IAM client.
+    """
+    try:
+        paginator_users = iam_client.get_paginator('list_users')
+        for page in paginator_users.paginate():
+            for user in page['Users']:
+                user_name = user['UserName']
+                print_info(f"User Name: {user_name}", MAGENTA)
+                paginator_policies = iam_client.get_paginator('list_attached_user_policies')
+                for policy_page in paginator_policies.paginate(UserName=user_name):
+                    for policy in policy_page['AttachedPolicies']:
+                        print_info(f"  Policy Name: {policy['PolicyName']}, ARN: {policy['PolicyArn']}", BRIGHT_GREEN)
+    except Exception as e:
+        print_error(f"Error listing attached user policies: {e}")
 
-            except HttpError as e:
-                if e.resp.status == 409:  # Conflict error
-                    print_message(f"{ERROR_ICON} It can't be assigned '{role_name}': {e}", BRIGHT_RED)
-                    attempt += 1
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    print_message(f"Retrying in {wait_time} seconds...", BRIGHT_RED)
-                    time.sleep(wait_time)
-                else:
-                    print_message(f"{ERROR_ICON} It can't be assigned '{role_name}': {e}", BRIGHT_RED)
-                    break  # Exit the retry loop on non-conflict errors
 
-    print_footer("Role Assignment Completed")
+def manage_policy(iam, user_name, policy_arn, action):
+    """
+    Attach or detach a policy from a user.
 
-# Read roles from the CSV file
-roles = read_roles_from_csv(CSV_FILE_PATH)
+    Args:
+        iam (boto3.Client): IAM client.
+        user_name (str): IAM user name.
+        policy_arn (str): ARN of the policy to attach or detach.
+        action (str): 'attach' or 'detach'.
+    """
+    actions = {
+        "attach": iam.attach_user_policy,
+        "detach": iam.detach_user_policy
+    }
 
-# Call the function with the given inputs
-assign_role_to_service_account(PROJECT_ID, SERVICE_ACCOUNT_EMAIL, roles)
+    if action not in actions:
+        print_error(f"Invalid action '{action}'. Must be 'attach' or 'detach'.")
+        return
+
+    try:
+        actions[action](UserName=user_name, PolicyArn=policy_arn)
+        print_info(f"{action.capitalize()} policy {policy_arn} to user {user_name}.", BRIGHT_GREEN)
+    except ClientError as e:
+        print_error(f"Failed to {action} policy {policy_arn}: {e}")
+
+
+async def test_policy_access(iam):
+    """
+    Test if the user can perform an action with the attached policy.
+
+    Args:
+        iam (boto3.Client): IAM client.
+
+    Returns:
+        bool: True if the action is permitted, False otherwise.
+    """
+    try:
+        iam.list_roles()  # Example action
+        return True
+    except ClientError as e:
+        if 'AccessDeniedException' in str(e):
+            print_info("Policy did not grant access to the action.", BRIGHT_CYAN)
+        else:
+            print_error(f"Error testing policy: {e}")
+        return False
+
+
+async def check_policy(iam_client, user_name, policy_arn):
+    """
+    Attach the policy, test access, and detach the policy asynchronously.
+
+    Args:
+        iam_client (boto3.Client): IAM client.
+        user_name (str): IAM user name.
+        policy_arn (str): ARN of the policy to check.
+    """
+    try:
+        print_info(f"Testing policy: {policy_arn}", BRIGHT_CYAN)
+        manage_policy(iam_client, user_name, policy_arn, "attach")
+        if await test_policy_access(iam_client):
+            print_info(f"Potential vulnerability with policy {policy_arn}.", BRIGHT_RED)
+        manage_policy(iam_client, user_name, policy_arn, "detach")
+    except Exception as e:
+        print_error(f"An error occurred while checking policy {policy_arn}: {e}")
+
+
+async def check_all_policies(iam_client, user_name, csv_file):
+    """
+    Check if policies from a CSV file are accessible by a specific user asynchronously.
+
+    Args:
+        iam_client (boto3.Client): IAM client.
+        user_name (str): IAM user name.
+        csv_file (str): Path to the CSV file containing policy ARNs.
+    """
+    try:
+        policies_df = pd.read_csv(csv_file)
+        if 'PolicyArn' not in policies_df.columns:
+            print_error("CSV file must contain a 'PolicyArn' column.")
+            return
+
+        tasks = [check_policy(iam_client, user_name, policy_arn) for policy_arn in policies_df['PolicyArn']]
+        await asyncio.gather(*tasks)
+    except FileNotFoundError:
+        print_error(f"File not found: {csv_file}")
+    except pd.errors.EmptyDataError:
+        print_error(f"CSV file is empty: {csv_file}")
+    except pd.errors.ParserError:
+        print_error(f"CSV file is improperly formatted: {csv_file}")
+    except Exception as e:
+        print_error(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    # Prompt user for AWS credentials
+    AWS_ACCESS_KEY_ID = input(f"{BRIGHT_CYAN}Enter the Access Key ID: {RESET}")
+    AWS_SECRET_ACCESS_KEY = input(f"{BRIGHT_CYAN}Enter the Secret Access Key: {RESET}")
+    user_name = input(f"{BRIGHT_CYAN}Enter the user name of the role: {RESET}")
+    CSV_FILE_PATH = input(f"{BRIGHT_CYAN}Enter the path to the CSV file with policy ARNs: {RESET}")
+
+    # Initialize IAM client
+    iam_client = initialize_iam_client(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+
+    # Run synchronous functions
+    list_iam_users(iam_client)
+    list_attached_user_policies(iam_client)
+
+    # Run asynchronous tasks
+    asyncio.run(check_all_policies(iam_client, user_name, CSV_FILE_PATH))
